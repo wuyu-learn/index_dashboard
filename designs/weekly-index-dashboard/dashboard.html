@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>指数周期强弱 Dashboard</title>
+  <link rel="stylesheet" href="dashboard.css?v=2">
+</head>
+<body>
+  <main class="dashboard-shell" data-screen-label="指数周期强弱 Dashboard">
+    <header class="hero">
+      <div>
+        <div class="eyebrow">WEEKLY INDEX PULSE</div>
+        <h1>指数周期强弱</h1>
+        <p id="summary-text">正在读取行情数据…</p>
+      </div>
+      <div class="hero-meta">
+        <span>统计周期</span>
+        <strong id="period-count">—</strong>
+      </div>
+    </header>
+
+    <section class="control-bar" aria-label="榜单筛选">
+      <div id="category-tabs" class="tab-group" aria-label="指数类型"></div>
+      <div class="segmented" aria-label="涨跌方向">
+        <button type="button" data-mode="gain" class="is-active">涨幅</button>
+        <button type="button" data-mode="loss">跌幅</button>
+      </div>
+    </section>
+
+    <section class="leader-panel">
+      <header class="section-heading">
+        <div>
+          <span class="section-kicker" id="leader-kicker">最新一周</span>
+          <h2 id="leader-title">涨幅前 3</h2>
+        </div>
+        <div class="segmented scope-switch" aria-label="统计口径">
+          <button type="button" data-scope="latest" class="is-active">最新一周</button>
+          <button type="button" data-scope="interval">区间累计</button>
+        </div>
+      </header>
+      <div id="leader-cards" class="leader-cards"></div>
+      <p class="tracking-hint" id="tracking-hint">点击上方指数，可在下方各周期榜单中追踪它。</p>
+    </section>
+
+    <section class="matrix-panel">
+      <header class="section-heading matrix-heading">
+        <div>
+          <span class="section-kicker">周期排名矩阵</span>
+          <h2 id="matrix-title">每周涨幅前 5</h2>
+        </div>
+        <div id="tracked-label" class="tracked-label" hidden></div>
+      </header>
+      <div class="matrix-scroll">
+        <div id="ranking-matrix" class="ranking-matrix"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="data.js?v=4"></script>
+  <script src="dashboard.js?v=3"></script>
+</body>
+</html>

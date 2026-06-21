@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+node_modules
+
+# Demo 生成数据不提交，只保留人工维护的指数池源文件。
+data/*
+!data/data_result_fixed.xlsx
