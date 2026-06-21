@@ -1,14 +1,8 @@
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
-from html.parser import HTMLParser
-import ipaddress
 import json
 from pathlib import Path
-import re
-import socket
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -16,12 +10,11 @@ import pandas as pd
 from backend.collector.client import TushareClient
 from backend.collector.storage import write_csv_atomic
 from backend.config import Settings
-from .minimax import MiniMaxClient
+from backend.integrations.minimax import MiniMaxClient
+from backend.news.article import fetch_article, validate_public_url
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
-PROXY_BENCHMARK_NETWORK = ipaddress.ip_network("198.18.0.0/15")
-BENCHMARK_PROXY_HOSTS = {"so.html5.qq.com"}
 
 
 @dataclass(frozen=True)
@@ -31,59 +24,6 @@ class Candidate:
     link: str
     snippet: str
     date: str
-
-
-class ArticleParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.stack: List[tuple] = []
-        self.title_parts: List[str] = []
-        self.source_parts: List[str] = []
-        self.content_parts: List[str] = []
-
-    def handle_starttag(self, tag: str, attrs: List[tuple]) -> None:
-        classes = set(dict(attrs).get("class", "").split())
-        if tag in {"br"} and self._inside("article-content"):
-            self.content_parts.append("\n")
-        if tag not in {
-            "area", "base", "br", "col", "embed", "hr", "img",
-            "input", "link", "meta", "param", "source", "track", "wbr",
-        }:
-            self.stack.append((tag, classes))
-        if tag in {"p", "div"} and self._inside("article-content"):
-            self.content_parts.append("\n")
-
-    def handle_startendtag(self, tag: str, attrs: List[tuple]) -> None:
-        self.handle_starttag(tag, attrs)
-        self.handle_endtag(tag)
-
-    def handle_endtag(self, tag: str) -> None:
-        for index in range(len(self.stack) - 1, -1, -1):
-            if self.stack[index][0] == tag:
-                del self.stack[index:]
-                break
-
-    def handle_data(self, data: str) -> None:
-        if self._inside("article-title"):
-            self.title_parts.append(data)
-        if self._inside("article-user-right-title"):
-            self.source_parts.append(data)
-        if self._inside("article-content"):
-            self.content_parts.append(data)
-
-    def _inside(self, class_name: str) -> bool:
-        return any(class_name in classes for _, classes in self.stack)
-
-    def result(self) -> Dict[str, str]:
-        return {
-            "title": _clean_text("".join(self.title_parts)),
-            "source": _clean_text("".join(self.source_parts)),
-            "content": _clean_text("".join(self.content_parts)),
-        }
-
-
-def _clean_text(value: str) -> str:
-    return re.sub(r"\s+", " ", value).strip()
 
 
 class MarketReviewCollector:
@@ -103,14 +43,20 @@ class MarketReviewCollector:
         force: bool = False,
     ) -> Dict[str, Any]:
         parsed_date = datetime.strptime(target_date, "%Y%m%d").date()
-        output = (
-            self.settings.data_dir
-            / "raw"
-            / "market_review"
-            / f"{target_date}.json"
+        output = self.quarter_path(parsed_date)
+        existing_records = self.read_quarter_records(output)
+        existing = next(
+            (
+                item
+                for item in existing_records
+                if item.get("tradeDate") == target_date
+            ),
+            None,
         )
-        if output.exists() and not force:
-            return json.loads(output.read_text(encoding="utf-8"))
+        if existing is not None and not force:
+            result = dict(existing)
+            result["file"] = str(output)
+            return result
 
         calendar = self.get_calendar_day(target_date)
         if calendar["is_open"] != "1":
@@ -122,9 +68,11 @@ class MarketReviewCollector:
             }
 
         query = self.build_query(parsed_date)
-        raw_search = self.minimax.search(query)
-        raw_items = self.raw_organic_items(raw_search)
-        candidates = self.filter_candidates(raw_items, parsed_date)
+        search_result = self.minimax.search(query)
+        candidates = self.filter_candidates(
+            search_result.get("items", []),
+            parsed_date,
+        )
         selected = self.select_candidate(
             query,
             target_date,
@@ -158,15 +106,51 @@ class MarketReviewCollector:
             "contentSource": article["contentSource"],
             "collectedAt": datetime.now(SHANGHAI_TZ).isoformat(),
         }
-        output.parent.mkdir(parents=True, exist_ok=True)
-        temporary = output.with_suffix(".json.tmp")
+        records = [
+            item
+            for item in existing_records
+            if item.get("tradeDate") != target_date
+        ]
+        records.append(payload)
+        records.sort(key=lambda item: str(item.get("tradeDate", "")))
+        self.write_quarter_records(output, records)
+        result = dict(payload)
+        result["file"] = str(output)
+        return result
+
+    def quarter_path(self, target: date) -> Path:
+        quarter = (target.month - 1) // 3 + 1
+        return (
+            self.settings.data_dir
+            / "raw"
+            / "market_review"
+            / f"{target.year}-Q{quarter}.json"
+        )
+
+    @staticmethod
+    def read_quarter_records(path: Path) -> List[Dict[str, Any]]:
+        if not path.exists():
+            return []
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"无法读取季度收评文件：{path}") from exc
+        if not isinstance(value, list):
+            raise RuntimeError(f"季度收评文件必须是 JSON 数组：{path}")
+        return [item for item in value if isinstance(item, dict)]
+
+    @staticmethod
+    def write_quarter_records(
+        path: Path,
+        records: List[Dict[str, Any]],
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".json.tmp")
         temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            json.dumps(records, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        temporary.replace(output)
-        payload["file"] = str(output)
-        return payload
+        temporary.replace(path)
 
     def get_calendar_day(self, target_date: str) -> Dict[str, str]:
         path = self.settings.data_dir / "raw" / "trade_cal" / "SSE.csv"
@@ -218,13 +202,6 @@ class MarketReviewCollector:
         )
 
     @staticmethod
-    def raw_organic_items(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-        values: Any = payload.get("organic")
-        if not isinstance(values, list):
-            raise RuntimeError("MiniMax Search 返回中缺少 raw.organic 数组")
-        return [item for item in values if isinstance(item, dict)]
-
-    @staticmethod
     def filter_candidates(
         items: List[Dict[str, Any]],
         target: date,
@@ -263,10 +240,17 @@ class MarketReviewCollector:
             raise RuntimeError(
                 f"没有找到 {target_date} 当日标题含“收评”的候选"
             )
-        decision = self.minimax.choose_candidate(
+        compact = [asdict(item) for item in candidates]
+        prompt = self.build_selection_prompt(
             query,
             target_date,
-            [asdict(item) for item in candidates],
+            compact,
+        )
+        decision = self.minimax.chat_json(
+            "你是严谨的财经新闻筛选器，只输出JSON。",
+            prompt,
+            temperature=0.1,
+            max_tokens=800,
         )
         selected_index = decision.get("selected_index")
         selected = next(
@@ -286,81 +270,42 @@ class MarketReviewCollector:
             )
         return selected
 
+    @staticmethod
+    def build_selection_prompt(
+        query: str,
+        target_date: str,
+        candidates: List[Dict[str, Any]],
+    ) -> str:
+        return (
+            "你负责从通用搜索结果中识别财联社发布的A股收评。"
+            "候选数据来自MiniMax Search，经通用客户端统一为"
+            "index、title、link、snippet、date五个字段。"
+            "只能使用候选JSON中实际存在的字段判断，不补充外部事实。"
+            "index是候选序号，选择时必须原样返回；"
+            "title是搜索结果标题；link是结果链接；"
+            "snippet是搜索摘要，可能从正文中间截断；date是发布时间。"
+            "不能仅凭link域名判断文章来源。"
+            "候选已由代码过滤，保证date与目标日期一致且title包含“收评”。"
+            "请重点检查："
+            "一、title是否描述A股收盘表现，而非期货、港股、美股或其他市场；"
+            "二、snippet任意位置是否出现“财联社X月X日电”或"
+            "“财联社X月X日讯”，不要求位于snippet开头；"
+            "三、snippet是否包含A股指数收盘涨跌、沪深两市成交额、"
+            "盘面或板块表现等收盘综述信息。"
+            "如果没有符合条件的候选，selected_index必须为null。"
+            "返回严格JSON，不要Markdown或额外文字："
+            '{"selected_index":整数或null,"confidence":0到1,'
+            '"reason":"简短理由"}。'
+            f"\n查询词：{query}\n目标日期：{target_date}"
+            f"\n候选：{json.dumps(candidates, ensure_ascii=False)}"
+        )
+
     def fetch_article(self, url: str) -> Dict[str, Any]:
-        self._validate_public_url(url)
-        request = Request(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 Chrome/126 Safari/537.36"
-                )
-            },
-        )
-        try:
-            with urlopen(request, timeout=20) as response:
-                content_type = response.headers.get_content_type()
-                if content_type not in {"text/html", "application/xhtml+xml"}:
-                    raise RuntimeError(f"不支持的正文类型：{content_type}")
-                raw = response.read(2_000_001)
-                if len(raw) > 2_000_000:
-                    raise RuntimeError("网页内容超过 2MB 限制")
-                charset = response.headers.get_content_charset() or "utf-8"
-                html = raw.decode(charset, errors="replace")
-        except Exception as exc:
-            return {
-                "url": url,
-                "fetchStatus": "failed",
-                "error": str(exc),
-                "title": "",
-                "source": "",
-                "content": "",
-                "contentSource": "none",
-            }
-        parser = ArticleParser()
-        parser.feed(html)
-        article = parser.result()
-        article.update(
-            {
-                "url": url,
-                "fetchStatus": (
-                    "success" if article["content"] else "empty"
-                ),
-                "contentSource": (
-                    "webpage" if article["content"] else "none"
-                ),
-            }
-        )
-        return article
+        return fetch_article(url)
 
     @staticmethod
     def _validate_public_url(url: str) -> None:
-        parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise RuntimeError("候选链接不是有效的 HTTP(S) 地址")
-        hostname = parsed.hostname.lower()
-        if hostname in {"localhost"} or hostname.endswith(".local"):
-            raise RuntimeError("不允许访问本地地址")
-        try:
-            default_port = 443 if parsed.scheme == "https" else 80
-            addresses = socket.getaddrinfo(hostname, parsed.port or default_port)
-        except socket.gaierror as exc:
-            raise RuntimeError(f"无法解析候选链接域名：{hostname}") from exc
-        for address in addresses:
-            ip = ipaddress.ip_address(address[4][0])
-            if (
-                hostname in BENCHMARK_PROXY_HOSTS
-                and ip in PROXY_BENCHMARK_NETWORK
-            ):
-                continue
-            if (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                or ip.is_multicast
-                or ip.is_unspecified
-            ):
-                raise RuntimeError("候选链接解析到不安全的本地或私有地址")
+        validate_public_url(url)
 
 
 def default_trade_date() -> str:

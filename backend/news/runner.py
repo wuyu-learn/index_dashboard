@@ -4,10 +4,23 @@ import sys
 
 from backend.config import Settings
 from .market_review import MarketReviewCollector, default_trade_date
+from .morning_news import MorningNewsCollector
+
+
+COLLECTORS = {
+    "market-review": MarketReviewCollector,
+    "morning-news": MorningNewsCollector,
+}
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="采集财联社 A 股收评")
+    parser = argparse.ArgumentParser(description="采集财联社新闻")
+    parser.add_argument(
+        "--type",
+        choices=sorted(COLLECTORS),
+        default="market-review",
+        help="新闻类型，默认 market-review",
+    )
     parser.add_argument(
         "--date",
         default=default_trade_date(),
@@ -21,12 +34,13 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        result = MarketReviewCollector(Settings.from_env()).collect(
+        collector = COLLECTORS[args.type](Settings.from_env())
+        result = collector.collect(
             args.date,
             force=args.force,
         )
     except Exception as exc:
-        print(f"收评采集失败：{exc}", file=sys.stderr)
+        print(f"{args.type} 采集失败：{exc}", file=sys.stderr)
         return 1
 
     print(json.dumps(result, ensure_ascii=False, indent=2))

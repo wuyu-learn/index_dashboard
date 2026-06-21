@@ -8,8 +8,8 @@ from unittest.mock import patch
 import pandas as pd
 
 from backend.config import Settings
-from backend.news.minimax import MiniMaxClient
-from backend.news.market_review import ArticleParser, MarketReviewCollector
+from backend.integrations.minimax import MiniMaxClient
+from backend.news.market_review import MarketReviewCollector
 
 
 class FakeTushare:
@@ -34,12 +34,14 @@ class FakeTushare:
 class FakeMiniMax:
     def __init__(self):
         self.search_calls = []
-        self.choose_calls = []
+        self.chat_calls = []
 
     def search(self, query):
         self.search_calls.append(query)
         return {
-            "organic": [
+            "query": query,
+            "searchedAt": "2026-06-18T16:00:00+08:00",
+            "items": [
                 {
                     "title": "无关资讯",
                     "link": "https://example.com/other",
@@ -58,8 +60,8 @@ class FakeMiniMax:
             ]
         }
 
-    def choose_candidate(self, query, target_date, candidates):
-        self.choose_calls.append((query, target_date, candidates))
+    def chat_json(self, system, prompt, **options):
+        self.chat_calls.append((system, prompt, options))
         return {
             "selected_index": 1,
             "confidence": 0.98,
@@ -93,39 +95,12 @@ class MarketReviewTests(unittest.TestCase):
         query = MarketReviewCollector.build_query(date(2026, 6, 18))
         self.assertEqual(query, "财联社 收评 财联社6月18日电")
 
-    def test_article_parser_extracts_tencent_article(self):
-        parser = ArticleParser()
-        parser.feed(
-            """
-            <div class="article-title">测试标题</div>
-            <div class="article-user-right-title"><div>财联社</div></div>
-            <div class="article-content"><p>第一段。</p><p>第二段。</p></div>
-            """
-        )
-        result = parser.result()
-        self.assertEqual(result["title"], "测试标题")
-        self.assertEqual(result["source"], "财联社")
-        self.assertEqual(result["content"], "第一段。 第二段。")
-
-    def test_minimax_decision_parser_accepts_cli_message_shape(self):
-        payload = {
-            "content": [
-                {"type": "thinking", "thinking": "分析候选"},
-                {
-                    "type": "text",
-                    "text": (
-                        '{"selected_index":8,"confidence":0.95,'
-                        '"reason":"匹配"}'
-                    ),
-                },
-            ]
-        }
-        decision = MiniMaxClient._find_decision(payload)
-        self.assertEqual(decision["selected_index"], 8)
-
-    def test_minimax_candidate_payload_uses_documented_fields(self):
+    def test_market_review_prompt_uses_standardized_fields(self):
         minimax = FakeMiniMax()
-        candidates = [
+        prompt = MarketReviewCollector.build_selection_prompt(
+            "财联社 收评 财联社6月18日电",
+            "20260618",
+            [
             {
                 "index": 7,
                 "title": "收评：科创50指数大涨",
@@ -133,22 +108,16 @@ class MarketReviewTests(unittest.TestCase):
                 "date": "2026-06-18 15:12:57",
                 "link": "https://example.com/review",
             }
-        ]
-        decision = minimax.choose_candidate(
-            "财联社 收评 财联社6月18日电",
-            "20260618",
-            candidates,
+            ],
         )
-        self.assertEqual(decision["selected_index"], 1)
-        sent_candidates = minimax.choose_calls[0][2]
-        self.assertEqual(
-            set(sent_candidates[0]),
-            {"index", "title", "snippet", "date", "link"},
-        )
+        self.assertIn('"index": 7', prompt)
+        self.assertIn('"title": "收评：科创50指数大涨"', prompt)
+        self.assertIn('"link": "https://example.com/review"', prompt)
+        self.assertNotIn("raw.organic", prompt)
 
     def test_filter_candidates_keeps_only_matching_date_and_title(self):
         candidates = MarketReviewCollector.filter_candidates(
-            FakeMiniMax().search("")["organic"],
+            FakeMiniMax().search("")["items"],
             date(2026, 6, 18),
         )
         self.assertEqual([item.index for item in candidates], [1])
@@ -189,9 +158,10 @@ class MarketReviewTests(unittest.TestCase):
             candidates,
         )
         self.assertEqual(selected.title, "收评：科创板走强")
+        self.assertEqual(len(minimax.chat_calls), 1)
 
     @patch(
-        "backend.news.market_review.socket.getaddrinfo",
+        "backend.news.article.socket.getaddrinfo",
         return_value=[(2, 1, 6, "", ("192.168.1.10", 443))],
     )
     def test_url_validation_rejects_private_address(self, _getaddrinfo):
@@ -201,7 +171,7 @@ class MarketReviewTests(unittest.TestCase):
             )
 
     @patch(
-        "backend.news.market_review.socket.getaddrinfo",
+        "backend.news.article.socket.getaddrinfo",
         return_value=[(2, 1, 6, "", ("192.0.0.8", 443))],
     )
     def test_url_validation_allows_publicly_routable_special_cdn(
@@ -213,7 +183,7 @@ class MarketReviewTests(unittest.TestCase):
         )
 
     @patch(
-        "backend.news.market_review.socket.getaddrinfo",
+        "backend.news.article.socket.getaddrinfo",
         return_value=[(2, 1, 6, "", ("198.18.0.139", 443))],
     )
     def test_url_validation_allows_known_host_through_proxy_benchmark_range(
@@ -225,7 +195,7 @@ class MarketReviewTests(unittest.TestCase):
         )
 
     @patch(
-        "backend.news.market_review.socket.getaddrinfo",
+        "backend.news.article.socket.getaddrinfo",
         return_value=[(2, 1, 6, "", ("198.18.0.139", 443))],
     )
     def test_url_validation_rejects_unknown_host_on_proxy_benchmark_range(
@@ -262,7 +232,7 @@ class MarketReviewTests(unittest.TestCase):
                 Path(directory)
                 / "raw"
                 / "market_review"
-                / "20260618.json"
+                / "2026-Q2.json"
             )
             saved = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(result["status"], "success")
@@ -273,12 +243,51 @@ class MarketReviewTests(unittest.TestCase):
                 "三大指数震荡，截至收盘，沪深两市成交额放量。",
             )
             self.assertEqual(result["contentSource"], "webpage")
-            self.assertNotIn("searchResults", saved)
-            self.assertNotIn("selected", saved)
-            self.assertNotIn("selection", saved)
-            self.assertNotIn("calendar", saved)
-            self.assertNotIn("query", saved)
+            self.assertIsInstance(saved, list)
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved[0]["tradeDate"], "20260618")
+            self.assertNotIn("searchResults", saved[0])
+            self.assertNotIn("selected", saved[0])
+            self.assertNotIn("selection", saved[0])
+            self.assertNotIn("calendar", saved[0])
+            self.assertNotIn("query", saved[0])
             self.assertEqual(len(minimax.search_calls), 1)
+
+    def test_quarter_file_reuses_and_force_replaces_trade_date(self):
+        with TemporaryDirectory() as directory:
+            minimax = FakeMiniMax()
+            collector = TestCollector(
+                self.make_settings(directory),
+                tushare_client=FakeTushare(is_open="1"),
+                minimax_client=minimax,
+            )
+            first = collector.collect("20260618")
+            cached = collector.collect("20260618")
+            replaced = collector.collect("20260618", force=True)
+            path = Path(first["file"])
+            saved = json.loads(path.read_text(encoding="utf-8"))
+
+            self.assertEqual(first["file"], cached["file"])
+            self.assertEqual(replaced["file"], first["file"])
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved[0]["tradeDate"], "20260618")
+            self.assertEqual(len(minimax.search_calls), 2)
+
+    def test_quarter_path(self):
+        with TemporaryDirectory() as directory:
+            collector = TestCollector(
+                self.make_settings(directory),
+                tushare_client=FakeTushare(),
+                minimax_client=FakeMiniMax(),
+            )
+            self.assertEqual(
+                collector.quarter_path(date(2026, 6, 18)).name,
+                "2026-Q2.json",
+            )
+            self.assertEqual(
+                collector.quarter_path(date(2026, 7, 1)).name,
+                "2026-Q3.json",
+            )
 
 
 if __name__ == "__main__":

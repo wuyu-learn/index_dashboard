@@ -160,18 +160,59 @@ Tushare trade_cal 判断 SSE 是否交易
 → 按目标日期与标题“收评”硬过滤候选
 → MiniMax 文本模型从合格候选中选择
 → 下载公开资讯页并提取正文
-→ 保存 data/raw/market_review/{YYYYMMDD}.json
+→ 按季度保存 data/raw/market_review/{YYYY}-Q{季度}.json
 ```
 
 非交易日会直接跳过，不调用 MiniMax。正文抓取失败时保留搜索摘要，并将结果标记为 `partial`。
 最终 JSON 只保存被选中收评的交易日期、发布时间、来源、标题、链接、完整正文、正文来源及采集时间；搜索候选和模型判断过程不落盘。
+
+季度文件是按 `tradeDate` 升序排列的 JSON 数组。相同交易日默认直接复用已有记录；使用 `--force` 时替换该日记录，不会产生重复数据。
+
+## 财联社早间新闻精选
+
+使用独立新闻类型采集指定日期的“早间新闻精选”：
+
+```bash
+python -m backend.news.runner --type morning-news --date 20260618
+```
+
+搜索关键词为 `财联社X月X日早间新闻精选`。搜索结果先按发布日期和标题硬过滤，再由 MiniMax 文本模型确认财联社当日早间新闻汇总，最后获取网页正文并按季度保存至：
+
+```text
+data/raw/morning_news/{YYYY}-Q{季度}.json
+```
+
+季度记录按 `newsDate` 排序，同一天默认复用已有结果；添加 `--force` 可重新搜索并替换。
+
+### MiniMax 通用能力
+
+MiniMax Search 与文本模型封装位于：
+
+```text
+backend/integrations/minimax.py
+```
+
+其他数据任务可以复用：
+
+```python
+from backend.config import Settings
+from backend.integrations.minimax import MiniMaxClient
+
+client = MiniMaxClient(Settings.from_env())
+search_result = client.search("搜索关键词")
+structured = client.chat_json("只输出 JSON", "处理搜索结果")
+```
+
+`search()` 统一返回 `query`、`searchedAt` 和 `items`；每个业务模块自行负责后续过滤、模型提示词、正文获取和保存逻辑。
+
+收评与早间新闻精选共用 `backend/news/article.py` 的网页抓取和多解析器注册表。目前支持腾讯搜索资讯页、腾讯新闻正文页，并使用通用 `article/main` 结构作为兜底。
 
 ### 服务器定时执行
 
 赋予脚本执行权限：
 
 ```bash
-chmod +x scripts/run_market_review.sh
+chmod +x scripts/run_market_review.sh scripts/run_morning_news.sh
 ```
 
 编辑服务器的 `crontab`：
@@ -180,17 +221,19 @@ chmod +x scripts/run_market_review.sh
 crontab -e
 ```
 
-按上海时区每周一至周五晚上 `20:00` 执行：
+按上海时区每周一至周五执行：
 
 ```cron
 CRON_TZ=Asia/Shanghai
+0 10 * * 1-5 /path/to/etf_dashboard/scripts/run_morning_news.sh
 0 20 * * 1-5 /path/to/etf_dashboard/scripts/run_market_review.sh
 ```
 
 请将 `/path/to/etf_dashboard` 替换为服务器上的实际绝对路径。脚本会优先使用项目 `.venv`，并将执行日志写入：
 
 ```text
+data/metadata/morning-news.log
 data/metadata/market-review.log
 ```
 
-周一至周五仍可能遇到法定休市日；任务会通过 Tushare `trade_cal` 判断，非 A 股交易日不会调用 MiniMax。
+早间新闻精选在 `10:00` 执行，收评在 `20:00` 执行。周一至周五仍可能遇到法定休市日；两个任务都会通过 Tushare `trade_cal` 判断，非 A 股交易日不会调用 MiniMax。
